@@ -29,32 +29,40 @@ module.exports = async (req, res) => {
 
     // Step 1: Send form data to Google Sheets via Apps Script
     const scriptUrl = process.env.VITE_SCRIPT_URL;
+    let sheetsSuccess = false;
     if (scriptUrl) {
       try {
         await makeHttpRequest(scriptUrl, 'POST', {
           ...formData,
           submittedAt: new Date().toISOString(),
         });
+        sheetsSuccess = true;
+        console.log('[v0] Form data sent to Google Sheets successfully');
       } catch (error) {
-        console.error('Error sending to Google Sheets:', error.message);
+        console.error('[v0] Error sending to Google Sheets:', error.message);
         // Continue even if Google Sheets fails
       }
     }
 
     // Step 2: Upload resume to Google Drive if provided
     let driveFileUrl = null;
+    let driveSuccess = false;
     if (resumeBase64 && process.env.GOOGLE_DRIVE_API_KEY && process.env.GOOGLE_DRIVE_FOLDER_ID) {
       try {
         driveFileUrl = await uploadToDrive(
           resumeBase64,
-          `${formData.fullName}_Resume.pdf`,
+          `${formData.fullName}_Resume${getFileExtension(resumeFile?.name || '.pdf')}`,
           process.env.GOOGLE_DRIVE_FOLDER_ID,
           process.env.GOOGLE_DRIVE_API_KEY
         );
+        driveSuccess = true;
+        console.log('[v0] Resume uploaded to Google Drive:', driveFileUrl);
       } catch (error) {
-        console.error('Error uploading to Google Drive:', error.message);
+        console.error('[v0] Error uploading to Google Drive:', error.message);
         // Continue even if Drive upload fails
       }
+    } else if (resumeBase64) {
+      console.warn('[v0] Resume file present but missing Drive credentials (GOOGLE_DRIVE_API_KEY or GOOGLE_DRIVE_FOLDER_ID)');
     }
 
     // Step 3: Return success response
@@ -62,15 +70,22 @@ module.exports = async (req, res) => {
       success: true,
       message: 'Form submitted successfully',
       driveLink: driveFileUrl,
+      sheetsSubmitted: sheetsSuccess,
+      driveSubmitted: driveSuccess,
     });
   } catch (error) {
-    console.error('Form submission error:', error);
+    console.error('[v0] Form submission error:', error);
     return res.status(500).json({
       success: false,
       error: 'Failed to submit form: ' + error.message,
     });
   }
 };
+
+function getFileExtension(fileName) {
+  const ext = fileName.substring(fileName.lastIndexOf('.'));
+  return ext || '.pdf';
+}
 
 function makeHttpRequest(url, method, data) {
   return new Promise((resolve, reject) => {
@@ -93,7 +108,11 @@ function makeHttpRequest(url, method, data) {
         responseData += chunk;
       });
       res.on('end', () => {
-        resolve(responseData);
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          resolve(responseData);
+        } else {
+          reject(new Error(`HTTP ${res.statusCode}: ${responseData}`));
+        }
       });
     });
 
@@ -105,54 +124,77 @@ function makeHttpRequest(url, method, data) {
 
 async function uploadToDrive(fileBase64, fileName, folderId, apiKey) {
   try {
-    // First, create the file metadata
-    const createData = {
+    console.log('[v0] Starting Drive upload for:', fileName);
+    
+    // Decode base64 to get file content
+    const fileContent = Buffer.from(fileBase64, 'base64');
+    console.log('[v0] File size:', fileContent.length, 'bytes');
+
+    // Create file metadata
+    const metadata = {
       name: fileName,
       parents: [folderId],
+      mimeType: getMimeType(fileName),
     };
 
-    const createResponse = await makeHttpRequest(
-      `https://www.googleapis.com/drive/v3/files?key=${apiKey}`,
+    // Create multipart body for file upload
+    const boundary = '===============7330845974216740156==';
+    const multipartBody = Buffer.concat([
+      Buffer.from(`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n`),
+      Buffer.from(JSON.stringify(metadata)),
+      Buffer.from(`\r\n--${boundary}\r\nContent-Type: ${metadata.mimeType}\r\n\r\n`),
+      fileContent,
+      Buffer.from(`\r\n--${boundary}--`),
+    ]);
+
+    // Upload file with multipart
+    const uploadUrl = `https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&key=${apiKey}`;
+    
+    const uploadResponse = await makeHttpRequestMultipart(
+      uploadUrl,
       'POST',
-      createData
+      multipartBody,
+      `multipart/related; boundary="${boundary}"`
     );
 
-    const fileData = JSON.parse(createResponse);
+    const fileData = JSON.parse(uploadResponse);
     const fileId = fileData.id;
-
-    // Then upload the file content using multipart
-    const fileContent = Buffer.from(fileBase64, 'base64');
-    await uploadFileContent(fileId, fileContent, apiKey);
-
-    // Make the file publicly accessible (optional)
-    const permissionData = {
-      role: 'reader',
-      type: 'anyone',
-    };
-
-    await makeHttpRequest(
-      `https://www.googleapis.com/drive/v3/files/${fileId}/permissions?key=${apiKey}`,
-      'POST',
-      permissionData
-    );
+    console.log('[v0] File created with ID:', fileId);
 
     // Return the file link
-    return `https://drive.google.com/file/d/${fileId}/view`;
+    const driveLink = `https://drive.google.com/file/d/${fileId}/view`;
+    return driveLink;
   } catch (error) {
-    console.error('Drive upload error:', error.message);
+    console.error('[v0] Drive upload error:', error.message);
     throw error;
   }
 }
 
-function uploadFileContent(fileId, fileContent, apiKey) {
+function getMimeType(fileName) {
+  const ext = fileName.toLowerCase().substring(fileName.lastIndexOf('.'));
+  const mimeTypes = {
+    '.pdf': 'application/pdf',
+    '.doc': 'application/msword',
+    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.txt': 'text/plain',
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+  };
+  return mimeTypes[ext] || 'application/octet-stream';
+}
+
+function makeHttpRequestMultipart(url, method, body, contentType) {
   return new Promise((resolve, reject) => {
+    const urlObj = new URL(url);
+
     const options = {
-      hostname: 'www.googleapis.com',
-      path: `/upload/drive/v3/files/${fileId}?uploadType=media&key=${apiKey}`,
-      method: 'PATCH',
+      hostname: urlObj.hostname,
+      path: urlObj.pathname + urlObj.search,
+      method: method,
       headers: {
-        'Content-Type': 'application/octet-stream',
-        'Content-Length': fileContent.length,
+        'Content-Type': contentType,
+        'Content-Length': body.length,
       },
     };
 
@@ -162,12 +204,16 @@ function uploadFileContent(fileId, fileContent, apiKey) {
         responseData += chunk;
       });
       res.on('end', () => {
-        resolve(responseData);
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          resolve(responseData);
+        } else {
+          reject(new Error(`HTTP ${res.statusCode}: ${responseData}`));
+        }
       });
     });
 
     req.on('error', reject);
-    req.write(fileContent);
+    req.write(body);
     req.end();
   });
 }
