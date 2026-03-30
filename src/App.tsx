@@ -22,6 +22,11 @@ interface FormData {
   resume: string;
 }
 
+interface AppState {
+  formData: FormData;
+  resumeFile: File | null;
+}
+
 interface FormErrors {
   [key: string]: string;
 }
@@ -86,10 +91,12 @@ export default function App() {
     applyingFor: '', experienceLevel: '', skills: '', preferredLocation: '',
     jobMelaCity: '', resume: '',
   });
+  const [resumeFile, setResumeFile] = useState<File | null>(null);
   const [errors, setErrors] = useState<FormErrors>({});
   const [touched, setTouched] = useState<{ [key: string]: boolean }>({});
   const [isSubmitted, setIsSubmitted] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submissionError, setSubmissionError] = useState('');
   const [progress, setProgress] = useState(0);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
 
@@ -197,6 +204,19 @@ export default function App() {
     const file = e.target.files?.[0];
     const name = e.target.name;
     if (file) {
+      // Validate file size (max 10MB)
+      if (file.size > 10 * 1024 * 1024) {
+        setErrors(prev => ({ ...prev, [name]: 'File size must be less than 10MB' }));
+        return;
+      }
+      // Validate file type
+      const allowedTypes = ['application/pdf', 'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'];
+      if (!allowedTypes.includes(file.type)) {
+        setErrors(prev => ({ ...prev, [name]: 'Only PDF and Word documents are allowed' }));
+        return;
+      }
+      
+      setResumeFile(file);
       setFormData(prev => ({ ...prev, [name]: file.name }));
       setErrors(prev => ({ ...prev, [name]: '' }));
       setTouched(prev => ({ ...prev, [name]: true }));
@@ -237,21 +257,45 @@ export default function App() {
 
     if (Object.keys(newErrors).length === 0) {
       setIsSubmitting(true);
-      // Send to Google Sheets via Apps Script (fire-and-forget)
-      const scriptUrl = import.meta.env.VITE_SCRIPT_URL;
-      if (scriptUrl) {
-        fetch(scriptUrl, {
+      setSubmissionError('');
+      
+      try {
+        // Convert resume file to base64 if present
+        let resumeBase64 = '';
+        if (resumeFile) {
+          resumeBase64 = await fileToBase64(resumeFile);
+        }
+
+        // Send to backend API
+        const response = await fetch('/api/submit-form', {
           method: 'POST',
-          mode: 'no-cors',
-          headers: { 'Content-Type': 'text/plain' },
-          body: JSON.stringify({ ...formData, submittedAt: new Date().toISOString() }),
-        }).catch(() => {});
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            formData: { ...formData, submittedAt: new Date().toISOString() },
+            resumeBase64,
+            resumeFile: resumeFile ? { name: resumeFile.name, type: resumeFile.type } : null,
+          }),
+        });
+
+        if (!response.ok) {
+          throw new Error('Failed to submit form');
+        }
+
+        const result = await response.json();
+        
+        // Store data locally as backup
+        localStorage.setItem('cognitoRegistration', JSON.stringify(formData));
+        if (result.driveLink) {
+          localStorage.setItem('cognitoResumeLink', result.driveLink);
+        }
+
+        setIsSubmitting(false);
+        setIsSubmitted(true);
+      } catch (error) {
+        console.error('Submission error:', error);
+        setSubmissionError('Failed to submit form. Please try again.');
+        setIsSubmitting(false);
       }
-      // Brief delay to let the request fire before showing success
-      await new Promise(resolve => setTimeout(resolve, 900));
-      localStorage.setItem('cognitoRegistration', JSON.stringify(formData));
-      setIsSubmitting(false);
-      setIsSubmitted(true);
     } else {
       const firstErrorField = Object.keys(newErrors)[0];
       const element = document.getElementsByName(firstErrorField)[0];
@@ -259,6 +303,19 @@ export default function App() {
         element.scrollIntoView({ behavior: 'smooth', block: 'center' });
       }
     }
+  };
+
+  const fileToBase64 = (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = reader.result as string;
+        const base64 = result.split(',')[1];
+        resolve(base64);
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
   };
 
   if (isSubmitted) {
@@ -521,6 +578,20 @@ export default function App() {
                   I hereby declare that all the information provided above is true to the best of my knowledge. I agree to the <span className="text-blue-900 font-bold underline">Terms & Conditions</span> of Cognito Insights.
                 </label>
               </div>
+
+              {submissionError && (
+                <motion.div 
+                  initial={{ opacity: 0, y: -10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  className="bg-red-50 border-2 border-red-200 rounded-2xl p-4 flex items-start gap-3"
+                >
+                  <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
+                  <div className="flex-1">
+                    <h4 className="font-bold text-red-900 mb-1">Submission Error</h4>
+                    <p className="text-red-700 text-sm">{submissionError}</p>
+                  </div>
+                </motion.div>
+              )}
 
               <div className="flex flex-col sm:flex-row gap-4">
                 <motion.button 
